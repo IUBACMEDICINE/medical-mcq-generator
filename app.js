@@ -587,6 +587,7 @@ function renderEditor() {
   setVal("settingEditedBy", examData.settings.editedBy || "");
   setVal("settingPrimaryColor", examData.settings.primaryColor || "#0badef");
   setVal("settingChoiceColor", examData.settings.choiceColor || examData.settings.primaryColor || "#0badef");
+  renderOriginalCoverBox();
 
   const container = document.getElementById("questionBlocksContainer");
   container.innerHTML = "";
@@ -726,6 +727,40 @@ function createCoverBlockElement(q, index, assignedPage = 2) {
 
 // Editor card for a picture-only page imported from a PDF (e.g. Canva file made of screenshots).
 // It is printed exactly as the original picture, on its own page.
+// Cover tab: shows the original cover taken from an uploaded PDF, with a way back
+// to the app's own (editable) cover design.
+function renderOriginalCoverBox() {
+  const tab = document.getElementById("coverTabContent");
+  if (!tab) return;
+  let box = document.getElementById("originalCoverBox");
+  const img = examData.settings.coverImage;
+  if (!img) {
+    if (box) box.remove();
+    return;
+  }
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "originalCoverBox";
+    box.className = "settings-section";
+    tab.insertBefore(box, tab.firstChild);
+  }
+  box.innerHTML = `
+    <div class="settings-section-title">Original cover (from the uploaded PDF)</div>
+    <div style="display:flex; gap:12px; align-items:flex-start;">
+      <img src="${img}" alt="Original cover" style="width:90px; border:1px solid #cbd5e1; border-radius:4px;">
+      <div style="font-size:12px; color:#334155; line-height:1.5;">
+        Page 1 shows the PDF's own cover, exactly as it was. The fields below are not used while it is shown.<br>
+        <button type="button" class="btn btn-outline" id="btnUseDesignCover" style="margin-top:8px;">Use the app's cover design instead</button>
+      </div>
+    </div>`;
+  box.querySelector("#btnUseDesignCover").addEventListener("click", () => {
+    delete examData.settings.coverImage;
+    saveData();
+    renderEditor();
+    renderPreview();
+  });
+}
+
 function createScanBlockElement(q, index, assignedPage = 2) {
   const card = document.createElement("div");
   card.className = "question-block";
@@ -761,8 +796,8 @@ function createScanBlockElement(q, index, assignedPage = 2) {
   const note = document.createElement("div");
   note.style.cssText = "font-size:12px; color:#334155; line-height:1.5;";
   note.innerHTML = `<b>${escapeHtml(q.label || "Original picture")}</b><br>
-    This page had no text (it is made of pictures), so it is printed exactly as it was.
-    Its questions were also read with OCR (✅ ticks become the answers) and follow as editable blocks - keep the picture, the blocks, or both.`;
+    This page of the uploaded PDF is printed exactly as it was.
+    Add your own questions before or after it with the + buttons.`;
   body.appendChild(thumb);
   body.appendChild(note);
 
@@ -1195,8 +1230,12 @@ function renderPreview() {
 
   applyThemeColor();
 
-  // 1. Render Page 1 (The Cover Page)
-  container.appendChild(buildCoverPage(s, "pdf-page-1", "Page 1"));
+  // 1. Render Page 1 (The Cover Page) - the original cover of an uploaded PDF, or the app's design
+  container.appendChild(
+    s.coverImage
+      ? createImagePageElement({ image: s.coverImage, label: "Cover page" }, 1)
+      : buildCoverPage(s, "pdf-page-1", "Page 1")
+  );
 
   // 2. Partition Questions into Pages
   const pagesList = partitionQuestionsIntoPages(examData.questions, s.questionsPerPage || 5);

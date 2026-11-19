@@ -72,6 +72,7 @@
     examData.questions = [];
 
     if (resetCover) {
+      delete examData.settings.coverImage;
       Object.assign(examData.settings, {
         subject: "HLS-Pharmacology",
         archiveBadge: "Archive",

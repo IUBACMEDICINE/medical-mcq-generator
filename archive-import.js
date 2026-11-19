@@ -499,12 +499,47 @@ function parseRawQuestions(text) {
     // intent "print": pdf.js then renders without requestAnimationFrame, which the browser
     // pauses while the window is in the background (the import would hang silently)
     await page.render({ canvasContext: canvas.getContext("2d"), viewport: viewport, intent: "print" }).promise;
-    return { image: canvas.toDataURL("image/jpeg", 0.85), accent: dominantAccent(canvas) };
+    return { image: canvas.toDataURL("image/jpeg", 0.85), accent: dominantAccent(canvas), blank: isBlankCanvas(canvas) };
   }
 
-  // wantSettingsCover: true  -> a cover on page 1 fills the app's own cover page (old behaviour)
-  //                    false -> a cover on page 1 is inserted like any other cover
-  // Every other cover page found inside the PDF is inserted in position, as an image.
+  // An empty (all white) page, e.g. an extra page left over by printing
+  function isBlankCanvas(canvas) {
+    try {
+      const w = 100;
+      const h = Math.max(1, Math.round((canvas.height * w) / canvas.width));
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext("2d");
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, w, h);
+      ctx.drawImage(canvas, 0, 0, w, h);
+      const d = ctx.getImageData(0, 0, w, h).data;
+      let dark = 0;
+      for (let i = 0; i < d.length; i += 4) if (d[i] < 235 || d[i + 1] < 235 || d[i + 2] < 235) dark++;
+      return dark < (w * h) * 0.002;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // A page made by this website (or in the same style): numbered questions with
+  // options and/or "Ans:" lines in real, selectable text.
+  function isQuestionPage(lines) {
+    const nQ = lines.filter((l) => Q_RE.test(l)).length;
+    const nChoice = lines.filter((l) => /^[a-fA-F]\s*[.)]\s*\S/.test(l)).length;
+    const nAns = lines.filter((l) => ANS_RE.test(l)).length;
+    return nQ >= 2 || (nQ >= 1 && (nChoice >= 2 || nAns >= 1));
+  }
+
+  // Uploading a PDF keeps it as it is:
+  //  - pages with typical questions (like the ones this website makes) are read as text
+  //    and become editable question blocks;
+  //  - every other page (screenshots, photos, scanned or designed pages) is inserted
+  //    unchanged as a picture page. You can add your own questions between them.
+  //  - the first page: if the file has typical questions, a cover on page 1 fills the
+  //    app's own (editable) cover; otherwise the original first page becomes the cover.
+  // wantSettingsCover: false when an earlier file already set the cover.
   async function readPdf(file, wantSettingsCover) {
     if (typeof pdfjsLib === "undefined") {
       throw new Error("PDF reader library did not load (check your internet connection).");
@@ -514,35 +549,41 @@ function parseRawQuestions(text) {
     const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
 
     const pages = [];
-    let scannedPages = 0;
-    const ocrErrors = [];
     for (let p = 1; p <= pdf.numPages; p++) {
+      setStatus("Reading PDF page " + p + " of " + pdf.numPages + "...");
       const page = await pdf.getPage(p);
       const content = await page.getTextContent();
-      let lines = pageToLines(content.items);
-      let scanned = false;
-      // Pages made of screenshots (e.g. a Canva file with pasted question pictures) have
-      // no text layer at all: read them with OCR instead of silently skipping them.
-      if (lines.join("").replace(/\s/g, "").length < 15) {
+      const lines = pageToLines(content.items);
+      pages.push({
+        page: page,
+        num: p,
+        lines: lines,
+        isCover: isCoverLines(lines),
+        isQuestions: isQuestionPage(lines),
+      });
+    }
+    const typicalFile = pages.some((pg) => pg.isQuestions);
+    // In a file made like this website's, a page with even one numbered question
+    // (e.g. a single short-answer question) is a question page too.
+    if (typicalFile) pages.forEach((pg) => {
+      if (!pg.isQuestions && pg.lines.some((l) => Q_RE.test(l))) pg.isQuestions = true;
+    });
+
+    // Page 1
+    let cover = null;
+    let coverImage = "";
+    let startAt = 0;
+    if (wantSettingsCover && pages.length > 1 && !pages[0].isQuestions) {
+      if (typicalFile && pages[0].lines.length) {
+        cover = parseCover(pages[0].lines); // editable cover in the app's design
+      } else {
         try {
-          const ocrLines = await ocrPdfPage(page, "PDF page " + p + " of " + pdf.numPages);
-          if (ocrLines.length) {
-            lines = ocrLines;
-            scannedPages++;
-          }
-          scanned = true;
+          coverImage = (await renderPageImage(pages[0].page)).image; // original cover, as it is
         } catch (err) {
-          console.warn("OCR failed for PDF page " + p, err);
-          if (p > 1) ocrErrors.push(p);
+          console.warn("Could not render the cover page", err);
         }
       }
-      pages.push({ page: page, num: p, lines: lines, scanned: scanned, isCover: isCoverLines(lines) });
-    }
-
-    // Page 1 with no numbered questions = cover page that fills the app's own cover
-    let cover = null;
-    if (wantSettingsCover && pages.length > 1 && !pages[0].lines.some((l) => Q_RE.test(l))) {
-      cover = parseCover(pages[0].lines);
+      startAt = cover || coverImage ? 1 : 0;
     }
 
     const norm = (s) => s.toLowerCase().replace(/\s+/g, "");
@@ -550,9 +591,12 @@ function parseRawQuestions(text) {
     let subjectNorm = cover ? norm(cover.subject || "") : "";
 
     // repeated page header ("RS- pathology", "RS- pathology Lecture 2", "Lecture 3+ 4") or "Page 2"
+    const footerNorm = norm((examData && examData.settings && examData.settings.customFooterText) || "");
     const isRepeatedHeader = (l) => {
       const n = norm(l);
       if (/^page\d+(of\d+|\/\d+)?$/.test(n)) return true;
+      // this website's page footer
+      if (n === "nextpagearemorequestions" || (footerNorm && n === footerNorm)) return true;
       if (LECT_ONLY.test(n)) return true;
       if (subjectNorm && n.startsWith(subjectNorm)) {
         const rest = n.slice(subjectNorm.length);
@@ -564,11 +608,20 @@ function parseRawQuestions(text) {
     const out = [];
     let coverCount = 0;
     let picturePages = 0;
-    for (let i = 0; i < pages.length; i++) {
+    let questionPages = 0;
+    for (let i = startAt; i < pages.length; i++) {
       const pg = pages[i];
-      if (cover && i === 0) continue;
 
-      if (pg.isCover) {
+      if (pg.isQuestions) {
+        questionPages++;
+        pg.lines.forEach((l) => {
+          if (!isRepeatedHeader(l)) out.push(l);
+        });
+        continue;
+      }
+
+      if (typicalFile && pg.isCover) {
+        // a cover between lectures of a file made by this website: editable cover
         const info = parseCover(pg.lines);
         subjectNorm = norm(info.subject || "");
         const id = "p" + Date.now().toString(36) + "_" + coverCount + "_" + pg.num;
@@ -594,51 +647,31 @@ function parseRawQuestions(text) {
         continue;
       }
 
-      // Picture-only page: keep the original page as a picture (photos, ✅ ticks and all),
-      // followed by the OCR text so the questions can also be rebuilt as editable blocks.
-      if (pg.scanned) {
-        const id = "s" + Date.now().toString(36) + "_" + pg.num;
-        try {
-          const rendered = await renderPageImage(pg.page);
-          window.pendingCoverPages[id] = {
-            image: rendered.image,
-            kind: "scan",
-            useImage: true,
-            label: "Original picture - PDF page " + pg.num,
-          };
-          out.push("[[COVER:" + id + "]]");
-          picturePages++;
-        } catch (err) {
-          console.warn("Could not render PDF page " + pg.num, err);
-        }
+      // anything else: keep the page exactly as it is
+      const id = "s" + Date.now().toString(36) + "_" + pg.num;
+      try {
+        const rendered = await renderPageImage(pg.page);
+        if (rendered.blank && !pg.lines.length) continue; // skip empty pages
+        window.pendingCoverPages[id] = {
+          image: rendered.image,
+          kind: "scan",
+          useImage: true,
+          label: "PDF page " + pg.num,
+        };
+        out.push("[[COVER:" + id + "]]");
+        picturePages++;
+      } catch (err) {
+        console.warn("Could not render PDF page " + pg.num, err);
       }
-
-      pg.lines.forEach((l) => {
-        if (isRepeatedHeader(l)) return;
-        out.push(l);
-      });
     }
-    if (ocrErrors.length && !out.length) {
-      throw new Error("this PDF contains only pictures and the screenshot reader (OCR) could not read them - check your internet connection and try again");
-    }
-    return { text: out.join("\n"), cover: cover, coverCount: coverCount, scannedPages: scannedPages, picturePages: picturePages };
-  }
-
-  // Render a PDF page big and white-backed, then OCR it (English + Arabic)
-  async function ocrPdfPage(page, label) {
-    const worker = await getOcrWorker();
-    ocrLabel = label;
-    const base = page.getViewport({ scale: 1 });
-    const scale = Math.min(4, 2400 / base.width);
-    const viewport = page.getViewport({ scale: scale });
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.round(viewport.width);
-    canvas.height = Math.round(viewport.height);
-    const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "#fff";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    await page.render({ canvasContext: ctx, viewport: viewport, background: "#fff", intent: "print" }).promise;
-    return ocrCanvasLines(worker, canvas);
+    return {
+      text: out.join("\n"),
+      cover: cover,
+      coverImage: coverImage,
+      coverCount: coverCount,
+      picturePages: picturePages,
+      questionPages: questionPages,
+    };
   }
 
   // Find a green tick (✅ / ✔) on a text line: a square-ish cluster of green pixels
@@ -890,13 +923,14 @@ function parseRawQuestions(text) {
     let cover = null;
     let coverTotal = 0;
     let shotCount = 0;
-    let scannedTotal = 0;
-    let pictureTotal = 0;
     let loadedJson = 0;
+    // PDFs without typical questions are added as they are (no text box step)
+    const asIsParts = [];
+    let asIsPages = 0;
+    let coverImage = "";
 
     // Screenshots take a while to read: open the import window so progress is visible
-    // (PDFs too: a PDF made of screenshots is read with OCR page by page)
-    if (files.some((f) => IMAGE_EXTS.indexOf(ext(f.name)) !== -1 || ext(f.name) === "pdf")) openBulkModal();
+    if (files.some((f) => IMAGE_EXTS.indexOf(ext(f.name)) !== -1)) openBulkModal();
 
     setStatus("Reading " + files.length + " file(s)...");
 
@@ -923,12 +957,17 @@ function parseRawQuestions(text) {
         } else if (e === "docx") {
           textParts.push(await readDocx(file));
         } else if (e === "pdf") {
-          const r = await readPdf(file, !cover);
-          if (r.text.trim()) textParts.push(r.text);
-          scannedTotal += r.scannedPages || 0;
-          pictureTotal += r.picturePages || 0;
-          coverTotal += r.coverCount || 0;
-          if (r.cover && !cover) cover = r.cover;
+          const r = await readPdf(file, !cover && !coverImage);
+          if (r.questionPages) {
+            // typical questions found: they become editable blocks via the text box
+            if (r.text.trim()) textParts.push(r.text);
+            coverTotal += r.coverCount || 0;
+            if (r.cover && !cover) cover = r.cover;
+          } else {
+            if (r.text.trim()) asIsParts.push(r.text);
+            asIsPages += r.picturePages || 0;
+            if (r.coverImage && !coverImage) coverImage = r.coverImage;
+          }
         } else if (e === "txt" || e === "md" || e === "csv") {
           textParts.push(await file.text());
         } else if (IMAGE_EXTS.indexOf(e) !== -1) {
@@ -962,6 +1001,37 @@ function parseRawQuestions(text) {
       }
     }
 
+    // PDF pages kept as they are: add them straight to the document
+    if (asIsParts.length || coverImage) {
+      const hasOwnContent = examData.questions.length > 0;
+      const replaceDoc = !hasOwnContent ||
+        confirm(
+          "Add the PDF as it is (" + (asIsPages + (coverImage ? 1 : 0)) + " page(s)).\n\n" +
+          "OK = start a new document with it (the current questions are removed)\n" +
+          "Cancel = add its pages after the current questions"
+        );
+      const items = parseRawQuestions(asIsParts.join("\n"));
+      if (coverImage) {
+        if (replaceDoc) {
+          examData.settings.coverImage = coverImage; // the original first page is the cover
+        } else {
+          const id = "s" + Date.now().toString(36) + "_cover";
+          items.unshift(makeCoverItem(id, { image: coverImage, kind: "scan", useImage: true, label: "PDF page 1 (cover)" }));
+        }
+      }
+      applyQuestions(items, replaceDoc);
+      if (!textParts.length) {
+        closeBulkModal();
+        alert(
+          "The PDF was added as it is: " + (asIsPages + (coverImage ? 1 : 0)) + " page(s)" +
+            (replaceDoc && coverImage ? ", its first page is the cover" : "") +
+            ". Use \"+ Add Question Block\" or the + buttons between pages to add your own questions." +
+            (problems.length ? "\n\nProblems: " + problems.join(" | ") : "")
+        );
+        return;
+      }
+    }
+
     if (textParts.length) {
       const area = document.getElementById("bulkInputText");
       const combined = normalizeText(textParts.join("\n\n"));
@@ -971,10 +1041,8 @@ function parseRawQuestions(text) {
         "Loaded " + textParts.length + " file(s)." +
           (coverTotal ? " Found " + coverTotal + " cover page(s) inside the file(s); they will be inserted in position (lines like [[COVER:...]] - keep them)." : "") +
           (shotCount ? " Screenshots are read automatically (OCR), so check the text for small mistakes." : "") +
-          (pictureTotal
-            ? " " + pictureTotal + " PDF page(s) were pictures: each one is kept as the original picture page (with its photos)." +
-              (scannedTotal ? " Their text was read with OCR into the box below and becomes editable question blocks: green ✅ ticks are taken as the answers, and \"---\" marks a new screenshot box. OCR makes small mistakes, so check the questions." : "")
-            : "") +
+          (asIsPages ? " " + asIsPages + " PDF page(s) without typical questions were added as they are." : "") +
+          " Pages of the PDF that are not questions are kept as pictures ([[COVER:...]] lines - keep them)." +
           " Check the text below, fix anything, then press \"Parse & Generate Blocks\"." +
           (problems.length ? " Problems: " + problems.join(" | ") : ""),
         problems.length > 0
