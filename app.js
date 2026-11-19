@@ -609,6 +609,7 @@ function renderEditor() {
 
 // Editor card for an inserted cover page. Fully editable, like the first cover page.
 function createCoverBlockElement(q, index, assignedPage = 2) {
+  if (q.kind === "scan") return createScanBlockElement(q, index, assignedPage);
   const card = document.createElement("div");
   card.className = "question-block";
   card.id = `block-${q.id}`;
@@ -717,6 +718,53 @@ function createCoverBlockElement(q, index, assignedPage = 2) {
     wrap.appendChild(lab);
     body.appendChild(wrap);
   }
+
+  card.appendChild(header);
+  card.appendChild(body);
+  return card;
+}
+
+// Editor card for a picture-only page imported from a PDF (e.g. Canva file made of screenshots).
+// It is printed exactly as the original picture, on its own page.
+function createScanBlockElement(q, index, assignedPage = 2) {
+  const card = document.createElement("div");
+  card.className = "question-block";
+  card.id = `block-${q.id}`;
+
+  const header = document.createElement("div");
+  header.className = "block-header";
+  header.innerHTML = `
+    <div class="block-title-group">
+      <span class="q-badge" style="background:#ede9fe; color:#5b21b6;">PICTURE</span>
+      <button class="btn-jump-page" title="View this page in the preview" style="font-size:11px; background:#e0f2fe; color:#0369a1; border:1px solid #bae6fd; border-radius:4px; padding:2px 7px; cursor:pointer; font-weight:600;">
+        📄 Page ${assignedPage}
+      </button>
+    </div>
+    <div class="block-actions">
+      <button class="icon-btn" title="Move Up" ${index === 0 ? 'disabled style="opacity:0.3;"' : ''} data-action="up">↑</button>
+      <button class="icon-btn" title="Move Down" ${index === examData.questions.length - 1 ? 'disabled style="opacity:0.3;"' : ''} data-action="down">↓</button>
+      <button class="icon-btn danger" title="Delete picture page" data-action="delete">🗑️</button>
+    </div>
+  `;
+  header.querySelector(".btn-jump-page")?.addEventListener("click", () => scrollToPage(assignedPage));
+  header.querySelector('[data-action="up"]')?.addEventListener("click", () => moveQuestion(index, -1));
+  header.querySelector('[data-action="down"]')?.addEventListener("click", () => moveQuestion(index, 1));
+  header.querySelector('[data-action="delete"]')?.addEventListener("click", () => deleteQuestion(index));
+
+  const body = document.createElement("div");
+  body.className = "block-body";
+  body.style.cssText = "display:flex; gap:12px; align-items:flex-start;";
+  const thumb = document.createElement("img");
+  thumb.src = q.image || "";
+  thumb.alt = q.label || "Original picture";
+  thumb.style.cssText = "width:110px; border:1px solid #cbd5e1; border-radius:4px; display:block; flex-shrink:0;";
+  const note = document.createElement("div");
+  note.style.cssText = "font-size:12px; color:#334155; line-height:1.5;";
+  note.innerHTML = `<b>${escapeHtml(q.label || "Original picture")}</b><br>
+    This page had no text (it is made of pictures), so it is printed exactly as it was.
+    Its text was also read with OCR into the import box: questions that have numbers (1. 2. ...) become editable blocks after it - keep the picture, the blocks, or both.`;
+  body.appendChild(thumb);
+  body.appendChild(note);
 
   card.appendChild(header);
   card.appendChild(body);
@@ -1110,7 +1158,7 @@ function duplicateQuestion(index) {
 
 function deleteQuestion(index) {
   const item = examData.questions[index];
-  const msg = item && item.type === "cover" ? "Delete this cover page?" : `Delete Question #${index + 1}?`;
+  const msg = item && item.type === "cover" ? (item.kind === "scan" ? "Delete this picture page?" : "Delete this cover page?") : `Delete Question #${index + 1}?`;
   if (confirm(msg)) {
     examData.questions.splice(index, 1);
     resequenceQuestionNumbers();

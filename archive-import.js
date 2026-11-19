@@ -38,6 +38,8 @@ function makeCoverItem(id, c) {
     editedBy: c.editedBy || "",
     correctedBy: c.correctedBy || "",
     primaryColor: c.primaryColor || "",
+    // "scan" = a picture-only page from a PDF (screenshots): always shown as the picture
+    kind: c.kind || "",
     // false = rebuilt from the fields above (editable); true = original PDF image
     useImage: !!(c.useImage && c.image),
     number: "",
@@ -264,33 +266,45 @@ function parseRawQuestions(text) {
       }
     });
 
-    return groups
-      .map((g) => {
-        g.items.sort((a, b) => a.x - b.x);
-        let s = "";
-        let prevEnd = null;
-        g.items.forEach((it) => {
-          if (prevEnd !== null) {
-            const gap = it.x - prevEnd;
-            if (gap > it.h * 0.25 && !s.endsWith(" ") && !it.s.startsWith(" ")) s += " ";
-          }
-          s += it.s;
-          prevEnd = it.x + it.w;
-        });
-        return s.replace(/\s+/g, " ").trim();
-      })
-      .filter(Boolean);
+    // Keep each line's font height and position next to it (lines.meta[i]) so a
+    // cover title that wraps inside its box ("Forensic" / "medicine") can be rejoined.
+    const lines = [];
+    lines.meta = [];
+    groups.forEach((g) => {
+      g.items.sort((a, b) => a.x - b.x);
+      let s = "";
+      let prevEnd = null;
+      let h = 0;
+      g.items.forEach((it) => {
+        if (prevEnd !== null) {
+          const gap = it.x - prevEnd;
+          if (gap > it.h * 0.25 && !s.endsWith(" ") && !it.s.startsWith(" ")) s += " ";
+        }
+        s += it.s;
+        prevEnd = it.x + it.w;
+        h = Math.max(h, it.h);
+      });
+      s = s.replace(/\s+/g, " ").trim();
+      if (!s) return;
+      lines.push(s);
+      lines.meta.push({ y: g.y, h: h });
+    });
+    return lines;
   }
 
+  // "Lecture 3", "Lec 2", "Group - D+c" ... the line shown in the lecture slot of the cover
+  const LECTURE_LINE_RE = /^(?:(?:lecture|lec\.?)\s*[-:–]?\s*\d|group\b\s*[-:–]?\s*\S)/i;
+
   function parseCover(lines) {
-    const info = { subject: lines[0] || "" };
-    const used = new Set([0]); // line indexes that are NOT part of the topic
+    const meta = lines.meta || [];
+    const info = { subject: "" };
+    const used = new Set(); // line indexes that are NOT part of the topic
     lines.forEach((l, i) => {
       let m;
       if (/^archive$/i.test(l)) {
         info.archive = l;
         used.add(i);
-      } else if (/^lecture\s*\d+/i.test(l)) {
+      } else if (!info.lecture && LECTURE_LINE_RE.test(l)) {
         info.lecture = l;
         used.add(i);
       } else if ((m = l.match(/^collected\s*by\s*:?\s*(.*)$/i))) {
@@ -307,6 +321,25 @@ function parseRawQuestions(text) {
         if (!m[1]) used.add(i + 1);
       }
     });
+
+    // Subject = first remaining line (the "Archive" badge is no longer mistaken for it),
+    // plus the next lines in the same font size right below it (a title wrapped in its box).
+    const s = lines.findIndex((_, i) => !used.has(i));
+    if (s !== -1) {
+      const parts = [lines[s]];
+      used.add(s);
+      for (let j = s + 1; j < lines.length && !used.has(j); j++) {
+        const a = meta[j - 1], b = meta[j];
+        if (!a || !b || !a.h || !b.h) break;
+        const sameSize = Math.abs(a.h - b.h) <= a.h * 0.08;
+        const close = Math.abs(a.y - b.y) <= a.h * 1.8;
+        if (!sameSize || !close) break;
+        parts.push(lines[j]);
+        used.add(j);
+      }
+      info.subject = parts.join(" ");
+    }
+
     info.topic = lines.filter((_, i) => !used.has(i)).join("\n");
     return info;
   }
@@ -314,7 +347,7 @@ function parseRawQuestions(text) {
   // A cover page: has "Lecture N" plus an "Archive" badge or a "... by <name>" credit,
   // and none of the things a question page has (numbered question, options, answer).
   function isCoverLines(lines) {
-    const hasLecture = lines.some((l) => /^lecture\s*\d/i.test(l));
+    const hasLecture = lines.some((l) => LECTURE_LINE_RE.test(l));
     const hasArchive = lines.some((l) => /^archive\b/i.test(l));
     const hasCredit = lines.some((l) => /\b(?:edit(?:ed|e)?|collected|done|corrected)\s*by\b/i.test(l));
     const hasQ = lines.some((l) => Q_RE.test(l));
@@ -377,11 +410,29 @@ function parseRawQuestions(text) {
     const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
 
     const pages = [];
+    let scannedPages = 0;
+    const ocrErrors = [];
     for (let p = 1; p <= pdf.numPages; p++) {
       const page = await pdf.getPage(p);
       const content = await page.getTextContent();
-      const lines = pageToLines(content.items);
-      pages.push({ page: page, num: p, lines: lines, isCover: isCoverLines(lines) });
+      let lines = pageToLines(content.items);
+      let scanned = false;
+      // Pages made of screenshots (e.g. a Canva file with pasted question pictures) have
+      // no text layer at all: read them with OCR instead of silently skipping them.
+      if (lines.join("").replace(/\s/g, "").length < 15) {
+        try {
+          const ocrLines = await ocrPdfPage(page, "PDF page " + p + " of " + pdf.numPages);
+          if (ocrLines.length) {
+            lines = ocrLines;
+            scannedPages++;
+          }
+          scanned = true;
+        } catch (err) {
+          console.warn("OCR failed for PDF page " + p, err);
+          if (p > 1) ocrErrors.push(p);
+        }
+      }
+      pages.push({ page: page, num: p, lines: lines, scanned: scanned, isCover: isCoverLines(lines) });
     }
 
     // Page 1 with no numbered questions = cover page that fills the app's own cover
@@ -408,6 +459,7 @@ function parseRawQuestions(text) {
 
     const out = [];
     let coverCount = 0;
+    let picturePages = 0;
     for (let i = 0; i < pages.length; i++) {
       const pg = pages[i];
       if (cover && i === 0) continue;
@@ -438,12 +490,56 @@ function parseRawQuestions(text) {
         continue;
       }
 
+      // Picture-only page: keep the original page as a picture (photos, ✅ ticks and all),
+      // followed by the OCR text so the questions can also be rebuilt as editable blocks.
+      if (pg.scanned) {
+        const id = "s" + Date.now().toString(36) + "_" + pg.num;
+        try {
+          const rendered = await renderPageImage(pg.page);
+          window.pendingCoverPages[id] = {
+            image: rendered.image,
+            kind: "scan",
+            useImage: true,
+            label: "Original picture - PDF page " + pg.num,
+          };
+          out.push("[[COVER:" + id + "]]");
+          picturePages++;
+        } catch (err) {
+          console.warn("Could not render PDF page " + pg.num, err);
+        }
+      }
+
       pg.lines.forEach((l) => {
         if (isRepeatedHeader(l)) return;
         out.push(l);
       });
     }
-    return { text: out.join("\n"), cover: cover, coverCount: coverCount };
+    if (ocrErrors.length && !out.length) {
+      throw new Error("this PDF contains only pictures and the screenshot reader (OCR) could not read them - check your internet connection and try again");
+    }
+    return { text: out.join("\n"), cover: cover, coverCount: coverCount, scannedPages: scannedPages, picturePages: picturePages };
+  }
+
+  // Render a PDF page big and white-backed, then OCR it (English + Arabic)
+  async function ocrPdfPage(page, label) {
+    const worker = await getOcrWorker();
+    ocrLabel = label;
+    const base = page.getViewport({ scale: 1 });
+    const scale = Math.min(4, 2400 / base.width);
+    const viewport = page.getViewport({ scale: scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(viewport.width);
+    canvas.height = Math.round(viewport.height);
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport: viewport, background: "#fff" }).promise;
+    const res = await worker.recognize(canvas);
+    return String((res && res.data && res.data.text) || "")
+      .replace(/\r/g, "")
+      .split("\n")
+      .map((l) => l.replace(/\s+/g, " ").trim())
+      .filter((l) => l && !isScreenshotHeader(l));
   }
 
   // ---------- Screenshots (OCR) ----------
@@ -599,10 +695,13 @@ function parseRawQuestions(text) {
     let cover = null;
     let coverTotal = 0;
     let shotCount = 0;
+    let scannedTotal = 0;
+    let pictureTotal = 0;
     let loadedJson = 0;
 
     // Screenshots take a while to read: open the import window so progress is visible
-    if (files.some((f) => IMAGE_EXTS.indexOf(ext(f.name)) !== -1)) openBulkModal();
+    // (PDFs too: a PDF made of screenshots is read with OCR page by page)
+    if (files.some((f) => IMAGE_EXTS.indexOf(ext(f.name)) !== -1 || ext(f.name) === "pdf")) openBulkModal();
 
     setStatus("Reading " + files.length + " file(s)...");
 
@@ -630,7 +729,9 @@ function parseRawQuestions(text) {
           textParts.push(await readDocx(file));
         } else if (e === "pdf") {
           const r = await readPdf(file, !cover);
-          textParts.push(r.text);
+          if (r.text.trim()) textParts.push(r.text);
+          scannedTotal += r.scannedPages || 0;
+          pictureTotal += r.picturePages || 0;
           coverTotal += r.coverCount || 0;
           if (r.cover && !cover) cover = r.cover;
         } else if (e === "txt" || e === "md" || e === "csv") {
@@ -675,6 +776,10 @@ function parseRawQuestions(text) {
         "Loaded " + textParts.length + " file(s)." +
           (coverTotal ? " Found " + coverTotal + " cover page(s) inside the file(s); they will be inserted in position (lines like [[COVER:...]] - keep them)." : "") +
           (shotCount ? " Screenshots are read automatically (OCR), so check the text for small mistakes." : "") +
+          (pictureTotal
+            ? " " + pictureTotal + " PDF page(s) were pictures: each one is kept as the original picture page (with its photos and ✅ answers)." +
+              (scannedTotal ? " Their text was read with OCR into the box below: to get editable question blocks too, number the questions (1. 2. ...), fix OCR mistakes and add the answers - ✅ ticks and photos can't be read as text." : "")
+            : "") +
           " Check the text below, fix anything, then press \"Parse & Generate Blocks\"." +
           (problems.length ? " Problems: " + problems.join(" | ") : ""),
         problems.length > 0
