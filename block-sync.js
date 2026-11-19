@@ -191,11 +191,14 @@
         chip.type = "button";
         chip.className = "ans-choice-chip" + (String(q.answer || "").toLowerCase() === L ? " active" : "");
         chip.textContent = L.toUpperCase();
+        chip.title = "Click again to clear the answer";
         chip.addEventListener("click", function () {
-          q.answer = L;
+          // Clicking the selected letter again clears it (answer unknown)
+          var isActive = String(q.answer || "").toLowerCase() === L;
+          q.answer = isActive ? "" : L;
           q.answerPrefix = "Ans: ";
           picker.querySelectorAll(".ans-choice-chip").forEach(function (c) {
-            c.classList.toggle("active", c === chip);
+            c.classList.toggle("active", !isActive && c === chip);
           });
           saveData();
           renderPreview();

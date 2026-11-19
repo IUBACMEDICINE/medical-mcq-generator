@@ -1191,8 +1191,11 @@ function createQuestionBlockElement(q, index, assignedPage = 2) {
       const chip = document.createElement("button");
       chip.className = `ans-choice-chip ${q.answer?.toLowerCase() === c.label?.toLowerCase() ? 'active' : ''}`;
       chip.textContent = c.label.toUpperCase();
+      chip.title = "Click again to clear the answer";
       chip.addEventListener("click", () => {
-        q.answer = c.label;
+        // Clicking the selected letter again clears it (answer unknown)
+        const isActive = String(q.answer || "").toLowerCase() === String(c.label || "").toLowerCase();
+        q.answer = isActive ? "" : c.label;
         q.answerPrefix = "Ans: ";
         saveData();
         renderEditor();
@@ -1280,7 +1283,7 @@ function addQuestion(defaultProps = {}, insertAt = null) {
       { label: "c", text: "" },
       { label: "d", text: "" }
     ],
-    answer: "a",
+    answer: "",
     answerPrefix: "Ans: ",
     sideNote: "",
     ...defaultProps
