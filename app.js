@@ -806,6 +806,204 @@ function createScanBlockElement(q, index, assignedPage = 2) {
   return card;
 }
 
+// ==========================================================================
+// Photos in questions
+// ==========================================================================
+// Photo size in the PDF and how much page room it takes (in "question slots",
+// so a page with photos holds fewer questions and nothing spills off the page).
+const PHOTO_SIZES = {
+  small: { label: "Small", width: "38%", maxHeight: "190px", weight: 1 },
+  medium: { label: "Medium", width: "58%", maxHeight: "290px", weight: 2 },
+  large: { label: "Large", width: "88%", maxHeight: "430px", weight: 3 },
+};
+
+function photoSize(q) {
+  return PHOTO_SIZES[q.imageSize] || PHOTO_SIZES.medium;
+}
+
+// Read an image file, shrink it (max 1400 px) and return a JPEG data URL,
+// so photos stay small enough for auto-save and the PDF.
+function loadPhotoFile(file) {
+  return new Promise((resolve, reject) => {
+    if (!file || !/^image\//.test(file.type)) {
+      reject(new Error("Please choose an image file (JPG, PNG, ...)."));
+      return;
+    }
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const max = 1400;
+      const scale = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement("canvas");
+      c.width = Math.max(1, Math.round(img.width * scale));
+      c.height = Math.max(1, Math.round(img.height * scale));
+      const ctx = c.getContext("2d");
+      ctx.fillStyle = "#fff";
+      ctx.fillRect(0, 0, c.width, c.height);
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c.toDataURL("image/jpeg", 0.85));
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Could not open this image."));
+    };
+    img.src = url;
+  });
+}
+
+// "Photo" field of a question block: add (button, paste Ctrl+V, drag & drop),
+// change size, replace or remove.
+function createPhotoField(q, card) {
+  const wrap = document.createElement("div");
+  wrap.className = "field-group photo-field";
+  wrap.style.cssText = "border:1px dashed #cbd5e1; border-radius:6px; padding:8px 10px; margin:6px 0;";
+
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.accept = "image/*";
+  fileInput.style.display = "none";
+
+  const setPhoto = async (file) => {
+    try {
+      q.image = await loadPhotoFile(file);
+      if (!q.imageSize) q.imageSize = "medium";
+      saveData();
+      renderEditor();
+      renderPreview();
+      const el = document.getElementById(`block-${q.id}`);
+      if (el) el.scrollIntoView({ block: "nearest" });
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files && fileInput.files[0]) setPhoto(fileInput.files[0]);
+    fileInput.value = "";
+  });
+
+  const draw = () => {
+    wrap.innerHTML = "";
+    wrap.appendChild(fileInput);
+    const label = document.createElement("div");
+    label.className = "field-label";
+    label.textContent = "Photo (optional)";
+    wrap.appendChild(label);
+
+    if (!q.image) {
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex; align-items:center; gap:10px; flex-wrap:wrap;";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "add-choice-btn";
+      btn.style.margin = "0";
+      btn.textContent = "📷 Add photo";
+      btn.addEventListener("click", () => fileInput.click());
+      const hint = document.createElement("span");
+      hint.style.cssText = "font-size:11px; color:#64748b;";
+      hint.textContent = "or drag a photo here, or paste one (Ctrl+V) while typing in this question";
+      row.appendChild(btn);
+      row.appendChild(hint);
+      wrap.appendChild(row);
+      return;
+    }
+
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex; gap:12px; align-items:flex-start;";
+    const thumb = document.createElement("img");
+    thumb.src = q.image;
+    thumb.alt = "Question photo";
+    thumb.style.cssText = "width:120px; max-height:120px; object-fit:contain; border:1px solid #cbd5e1; border-radius:4px; background:#fff;";
+    const controls = document.createElement("div");
+    controls.style.cssText = "display:flex; flex-direction:column; gap:6px; font-size:12px; color:#334155;";
+
+    const sizeRow = document.createElement("label");
+    sizeRow.style.cssText = "display:flex; align-items:center; gap:6px;";
+    sizeRow.appendChild(document.createTextNode("Size in PDF:"));
+    const sizeSel = document.createElement("select");
+    sizeSel.style.cssText = "padding:2px 4px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px;";
+    Object.keys(PHOTO_SIZES).forEach((k) => {
+      const o = document.createElement("option");
+      o.value = k;
+      o.textContent = PHOTO_SIZES[k].label;
+      if ((q.imageSize || "medium") === k) o.selected = true;
+      sizeSel.appendChild(o);
+    });
+    sizeSel.addEventListener("change", () => {
+      q.imageSize = sizeSel.value;
+      saveData();
+      renderEditor();
+      renderPreview();
+    });
+    sizeRow.appendChild(sizeSel);
+
+    const btns = document.createElement("div");
+    btns.style.cssText = "display:flex; gap:6px;";
+    const replaceBtn = document.createElement("button");
+    replaceBtn.type = "button";
+    replaceBtn.className = "add-choice-btn";
+    replaceBtn.style.margin = "0";
+    replaceBtn.textContent = "Replace";
+    replaceBtn.addEventListener("click", () => fileInput.click());
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "add-choice-btn";
+    removeBtn.style.cssText = "margin:0; color:#b91c1c; border-color:#fecaca;";
+    removeBtn.textContent = "Remove photo";
+    removeBtn.addEventListener("click", () => {
+      delete q.image;
+      delete q.imageSize;
+      saveData();
+      renderEditor();
+      renderPreview();
+    });
+    btns.appendChild(replaceBtn);
+    btns.appendChild(removeBtn);
+
+    controls.appendChild(sizeRow);
+    controls.appendChild(btns);
+    row.appendChild(thumb);
+    row.appendChild(controls);
+    wrap.appendChild(row);
+  };
+  draw();
+
+  // drag & drop a photo onto the field
+  wrap.addEventListener("dragover", (e) => {
+    if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files")) {
+      e.preventDefault();
+      e.stopPropagation();
+      wrap.style.background = "#f0f9ff";
+    }
+  });
+  wrap.addEventListener("dragleave", () => { wrap.style.background = ""; });
+  wrap.addEventListener("drop", (e) => {
+    wrap.style.background = "";
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) {
+      e.preventDefault();
+      e.stopPropagation(); // not an archive upload: keep it in this question
+      setPhoto(f);
+    }
+  });
+
+  // paste an image (Ctrl+V) anywhere in this question block
+  if (card) {
+    card.addEventListener("paste", (e) => {
+      const items = (e.clipboardData && e.clipboardData.items) || [];
+      for (const it of items) {
+        if (it.kind === "file" && /^image\//.test(it.type)) {
+          e.preventDefault();
+          e.stopPropagation(); // the photo belongs to this question, not to the screenshot importer
+          setPhoto(it.getAsFile());
+          return;
+        }
+      }
+    });
+  }
+  return wrap;
+}
+
 function createQuestionBlockElement(q, index, assignedPage = 2) {
   const card = document.createElement("div");
   card.className = "question-block";
@@ -1054,6 +1252,7 @@ function createQuestionBlockElement(q, index, assignedPage = 2) {
   });
 
   body.appendChild(part1);
+  body.appendChild(createPhotoField(q, card));
   body.appendChild(part2Grid);
   body.appendChild(pageBreakRow);
 
@@ -1363,6 +1562,7 @@ function buildCoverPage(s, pageId, indicatorText) {
 function partitionQuestionsIntoPages(questions, maxPerPage = 5) {
   const pages = [];
   let currentPage = [];
+  let weight = 0; // room used on the current page (1 per question, more with a photo)
   let header = null; // { subject, lecture } of the latest inserted cover page
 
   const pushPage = (arr) => {
@@ -1376,16 +1576,26 @@ function partitionQuestionsIntoPages(questions, maxPerPage = 5) {
       if (currentPage.length > 0) {
         pushPage(currentPage);
         currentPage = [];
+        weight = 0;
       }
       if (q.lecture || q.subject) header = { subject: q.subject, lecture: q.lecture };
       pushPage([q]);
       return;
     }
 
-    currentPage.push(q);
-    if (q.pageBreakAfter || currentPage.length >= maxPerPage) {
+    // a question with a photo takes the room of more than one question
+    const w = 1 + (q.image ? photoSize(q).weight : 0);
+    if (currentPage.length > 0 && weight + w > maxPerPage) {
       pushPage(currentPage);
       currentPage = [];
+      weight = 0;
+    }
+    currentPage.push(q);
+    weight += w;
+    if (q.pageBreakAfter || weight >= maxPerPage) {
+      pushPage(currentPage);
+      currentPage = [];
+      weight = 0;
     }
   });
 
@@ -1517,6 +1727,19 @@ function createContentPageElement(questions, pageNum, totalPages) {
     applyBidiTextStyle(titleEl, q.question);
     if (q.tag) applyBidiTextStyle(titleEl.querySelector(".rendered-tag-arabic"), q.tag);
     qEl.appendChild(titleEl);
+
+    // Photo under the question text
+    if (q.image) {
+      const sz = photoSize(q);
+      const photo = document.createElement("img");
+      photo.className = "rendered-q-photo";
+      photo.src = q.image;
+      photo.alt = "Question photo";
+      photo.style.cssText =
+        `display:block; max-width:${sz.width}; max-height:${sz.maxHeight}; width:auto; height:auto;` +
+        "object-fit:contain; margin:6px 0 8px 22px; border-radius:4px; border:1px solid #e2e8f0;";
+      qEl.appendChild(photo);
+    }
 
     if (isMcq) {
       // Multiple Choices Block with Side Answer
