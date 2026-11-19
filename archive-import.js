@@ -496,7 +496,9 @@ function parseRawQuestions(text) {
     const canvas = document.createElement("canvas");
     canvas.width = Math.round(viewport.width);
     canvas.height = Math.round(viewport.height);
-    await page.render({ canvasContext: canvas.getContext("2d"), viewport: viewport }).promise;
+    // intent "print": pdf.js then renders without requestAnimationFrame, which the browser
+    // pauses while the window is in the background (the import would hang silently)
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport: viewport, intent: "print" }).promise;
     return { image: canvas.toDataURL("image/jpeg", 0.85), accent: dominantAccent(canvas) };
   }
 
@@ -635,7 +637,7 @@ function parseRawQuestions(text) {
     const ctx = canvas.getContext("2d");
     ctx.fillStyle = "#fff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    await page.render({ canvasContext: ctx, viewport: viewport, background: "#fff" }).promise;
+    await page.render({ canvasContext: ctx, viewport: viewport, background: "#fff", intent: "print" }).promise;
     return ocrCanvasLines(worker, canvas);
   }
 
