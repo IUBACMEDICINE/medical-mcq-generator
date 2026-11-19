@@ -17,6 +17,14 @@ const BULLET_Q_RE = /^(?:»|>|•|▪|◦)\s*(.+)$/;
 // Accept both conventional choices (a. / a)) and OCR output without punctuation (a Choice).
 const LETTER_RE = /^([a-fA-F])(?:\s*[\.\)]\s*|\s+)(.+)$/;
 const ANS_RE = /^(?:answer|ans)\b\s*[:\-\.]?\s*(.*)$/i;
+// A tick after a choice marks the right answer ("B. Antidote ✅"), e.g. from screenshots
+const TICK_RE = /\s*[✅✔✓☑]\uFE0F?\s*/g;
+const hasTick = (s) => /[✅✔✓☑]/.test(s);
+// A line that reads as a question on its own ("Caused by?", "شو اسمها؟", "True statements:")
+const QUESTION_END_RE = /[?؟:]\s*[|)\]}]*\s*$/;
+// Written between screenshot boxes by the OCR reader (a big empty gap in the picture).
+// In text without question numbers it separates questions.
+const SEP_RE = /^-{3,}$/;
 
 // A cover page found in the middle of an uploaded PDF is represented in the text as
 // [[COVER:id]]; the page image lives in window.pendingCoverPages[id].
@@ -89,7 +97,7 @@ function buildQuestion(c, idx) {
     question = lines.join(" ");
   } else {
     type = "direct";
-    if (answer) {
+    if (answer || c.loose) {
       question = lines.join(" ");
     } else if (lines.length >= 2) {
       if (/[?:]$/.test(lines[0])) {
@@ -105,6 +113,19 @@ function buildQuestion(c, idx) {
     }
   }
 
+  // Options without letters, one marked with a tick (common in screenshots):
+  // "Caused by?" / "Non rifled weapon ✅" / "rifled weapon" -> MCQ a/b/...
+  if (type === "direct" && !c.answer && lines.length >= 3 && lines.length <= 8 && lines.slice(1).some(hasTick)) {
+    type = "mcq";
+    question = lines[0];
+    answer = "";
+    c.choices = lines.slice(1).map((l, i) => {
+      const label = String.fromCharCode(97 + i);
+      if (hasTick(l)) answer = label.toUpperCase();
+      return { label: label, text: l.replace(TICK_RE, " ").trim() };
+    });
+  }
+
   return {
     id: "q" + Date.now() + Math.random().toString(36).slice(2, 6) + idx,
     number: String(c.num),
@@ -112,10 +133,10 @@ function buildQuestion(c, idx) {
     question: question,
     tag: tag,
     pageBreakAfter: false,
-    choices: c.choices,
+    choices: c.choices.map((ch) => ({ label: ch.label, text: ch.text })),
     answer: answer || "",
     answerPrefix: type === "mcq" ? c.prefix : "",
-    sideNote: "",
+    sideNote: (c.notes || []).join(" "),
   };
 }
 
@@ -130,18 +151,50 @@ function parseRawQuestions(text) {
     cur = null;
   };
 
-  for (const raw of lines) {
+  // "Loose" mode only for parts (between page markers) that have no numbered questions,
+  // e.g. text read from screenshots: there, unnumbered lines start questions.
+  // Normal numbered documents are parsed exactly as before.
+  const looseAt = [];
+  {
+    let start = 0;
+    const mark = (end) => {
+      const numbered = lines.slice(start, end).filter((l) => Q_RE.test(l)).length >= 2;
+      for (let k = start; k < end; k++) looseAt[k] = !numbered;
+    };
+    lines.forEach((l, k) => {
+      if (COVER_MARK_RE.test(l)) {
+        mark(k);
+        start = k + 1;
+      }
+    });
+    mark(lines.length);
+  }
+
+  for (let li = 0; li < lines.length; li++) {
+    const raw = lines[li];
+    const loose = !!looseAt[li];
+    if (SEP_RE.test(raw)) {
+      // new box: the next text line starts a new question, but options that continue
+      // the open question (its options sit in their own box) still belong to it
+      if (loose && cur) cur.boxEnded = true;
+      continue;
+    }
     // 0) Cover-page marker (inserted when a PDF is read): keep the cover in position
     const cm = raw.match(COVER_MARK_RE);
     if (cm) {
       flush();
-      lastNum = 0;
       const c = (window.pendingCoverPages || {})[cm[1]];
+      // a real cover starts a new lecture (numbering restarts); a picture page does not
+      if (!c || c.kind !== "scan") lastNum = 0;
       if (c) out.push(makeCoverItem(cm[1], c));
       continue;
     }
 
-    for (const line of splitInlineAnswer(raw)) {
+    for (let line of splitInlineAnswer(raw)) {
+      // OCR reads "B." as "8." - fix it when it can only be option B (right after option A)
+      const lastLbl = cur && cur.choices.length ? cur.choices[cur.choices.length - 1].label : "";
+      if (loose && lastLbl === "a") line = line.replace(/^8\s*([.)])\s*/, "B$1 ");
+
       // 0) Arrow/bullet question marker (common in pasted notes and OCR).
       // Start a new question and assign the next available number automatically.
       let qm = line.match(BULLET_Q_RE);
@@ -204,17 +257,66 @@ function parseRawQuestions(text) {
       // while still allowing conventional "a. text" with any capitalization.
       const conventionalChoice = /^[a-fA-F]\s*[.)]/.test(choiceLine);
       const ocrChoice = m && /^[A-Z0-9]/.test(m[2]);
-      if (cur && m && (conventionalChoice || ocrChoice)) {
-        cur.choices.push({ label: m[1].toLowerCase(), text: m[2].trim() });
+      if ((cur || loose) && m && (conventionalChoice || ocrChoice)) {
+        const label = m[1].toLowerCase();
+        // Options start again at "a" with no question number in between: a new
+        // unnumbered question. The lines after the last option are its question text.
+        if (loose && cur && cur.boxEnded) {
+          const lastL = cur.choices.length ? cur.choices[cur.choices.length - 1].label : "";
+          if (label > lastL && (cur.choices.length || cur.lines.length)) cur.boxEnded = false;
+          else flush();
+        }
+        if (loose && !cur) {
+          // options with no question text before them (it was cut off in the screenshot)
+          lastNum += 1;
+          cur = { num: lastNum, lines: [], choices: [], answer: "", prefix: "Ans: ", loose: true };
+        } else if (loose && cur.choices.length && label <= cur.choices[cur.choices.length - 1].label) {
+          const stem = cur.tail || [];
+          if (stem.length) {
+            const lc = cur.choices[cur.choices.length - 1];
+            lc.text = lc.baseText;
+          }
+          flush();
+          lastNum += 1;
+          cur = { num: lastNum, lines: stem, choices: [], answer: "", prefix: "Ans: ", loose: true };
+        }
+        let text = m[2].trim();
+        if (hasTick(text)) {
+          text = text.replace(TICK_RE, " ").trim();
+          cur.answer = label.toUpperCase();
+        }
+        cur.choices.push({ label: label, text: text });
+        cur.tail = [];
         continue;
       }
 
-      // 4) Wrapped continuation line
-      if (!cur) continue;
+      // 4) Text with no question number (screenshots / OCR / loose notes)
       const t = line.replace(/^[\.\s]+/, "");
       if (!t) continue;
+      if (!cur && !loose) continue;
+      const newQ =
+        !cur ||
+        (loose && cur.boxEnded) ||
+        (loose && QUESTION_END_RE.test(t) && !hasTick(t) &&
+          (cur.choices.length || cur.lines.some((l) => /[?؟]/.test(l))));
+      if (newQ) {
+        // no question open yet, or this line reads as the next question
+        flush();
+        lastNum += 1;
+        cur = { num: lastNum, lines: [t], choices: [], answer: "", prefix: "Ans: ", loose: loose };
+        continue;
+      }
+      // Arabic remark after English options ("الباقي مو متذكرته") -> side note
+      if (loose && cur.choices.length && /[\u0600-\u06FF]/.test(t) &&
+          !/[\u0600-\u06FF]/.test(cur.choices[cur.choices.length - 1].text)) {
+        (cur.notes = cur.notes || []).push(t.replace(TICK_RE, " ").trim());
+        continue;
+      }
+      // Wrapped continuation line
       if (cur.choices.length) {
         const lc = cur.choices[cur.choices.length - 1];
+        if (!cur.tail || !cur.tail.length) lc.baseText = lc.text;
+        (cur.tail = cur.tail || []).push(t);
         lc.text = (lc.text + " " + t).trim();
       } else {
         cur.lines.push(t);
@@ -534,12 +636,108 @@ function parseRawQuestions(text) {
     ctx.fillStyle = "#fff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvasContext: ctx, viewport: viewport, background: "#fff" }).promise;
+    return ocrCanvasLines(worker, canvas);
+  }
+
+  // Find a green tick (✅ / ✔) on a text line: a square-ish cluster of green pixels
+  // inside the line's band, on the text or just to its right. Returns {x0,x1} or null.
+  function findGreenTick(ctx, W, bbox) {
+    const h = bbox.y1 - bbox.y0;
+    if (h < 6) return null;
+    const x0 = Math.max(0, bbox.x0);
+    const x1 = Math.min(W, bbox.x1 + 3 * h);
+    const w = x1 - x0;
+    if (w <= 0) return null;
+    let d;
+    try {
+      d = ctx.getImageData(x0, bbox.y0, w, h).data;
+    } catch (e) {
+      return null;
+    }
+    let n = 0, minX = Infinity, maxX = -1;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y * w + x) * 4;
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+        if (g > 140 && g - r > 50 && g - b > 30) {
+          n++;
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+        }
+      }
+    }
+    const width = maxX - minX + 1;
+    if (n < h * h * 0.2 || width < h * 0.4 || width > h * 1.8) return null;
+    return { x0: x0 + minX, x1: x0 + maxX };
+  }
+
+  // OCR a canvas line by line. Lines with a green tick get " ✅" at the end (the parser
+  // turns that into the answer); the junk characters OCR makes of the tick are removed,
+  // and lines that are only OCR noise (photos, borders) are dropped.
+  async function ocrCanvasLines(worker, canvas) {
     const res = await worker.recognize(canvas);
-    return String((res && res.data && res.data.text) || "")
-      .replace(/\r/g, "")
-      .split("\n")
-      .map((l) => l.replace(/\s+/g, " ").trim())
-      .filter((l) => l && !isScreenshotHeader(l));
+    const data = (res && res.data) || {};
+    const ctx = canvas.getContext("2d");
+    let lines;
+    if (Array.isArray(data.lines) && data.lines.length) {
+      lines = data.lines.map((ln) => {
+        let text = String(ln.text || "").replace(/\s+/g, " ").trim();
+        const tick = ln.bbox ? findGreenTick(ctx, canvas.width, ln.bbox) : null;
+        if (tick) {
+          (ln.words || []).forEach((wd) => {
+            const b = wd.bbox || {};
+            const mid = (b.x0 + b.x1) / 2;
+            if (mid >= tick.x0 - 5 && mid <= tick.x1 + 5) {
+              const t = String(wd.text || "").trim();
+              const k = t ? text.lastIndexOf(t) : -1;
+              if (k !== -1) text = (text.slice(0, k) + text.slice(k + t.length)).replace(/\s+/g, " ").trim();
+            }
+          });
+          text += " ✅";
+        }
+        // drop low-confidence junk at the end of an English line ("latent fingerprints “ee")
+        if (!/[\u0600-\u06FF]/.test(text)) {
+          const ws = (ln.words || []).slice().sort((a, b) => (b.bbox || {}).x0 - (a.bbox || {}).x0);
+          for (const wd of ws) {
+            const b = wd.bbox || {};
+            if (tick && (b.x0 + b.x1) / 2 >= tick.x0 - 5) continue;
+            const t = String(wd.text || "").trim();
+            if ((wd.confidence || 0) >= 45 || !t) break;
+            const k = text.lastIndexOf(t);
+            if (k === -1 || k + t.length < text.replace(/\s*✅$/, "").length) break;
+            text = (text.slice(0, k) + text.slice(k + t.length)).replace(/\s+/g, " ").trim();
+          }
+        }
+        return { text: text, conf: ln.confidence || 0, tick: !!tick, bbox: ln.bbox };
+      });
+    } else {
+      lines = String(data.text || "").split("\n").map((t) => ({ text: t.replace(/\s+/g, " ").trim(), conf: 100 }));
+    }
+    const kept = lines.filter((l) => {
+      l.text = l.text
+        .replace(/[\u200e\u200f\u202a-\u202e]/g, "")
+        .replace(/^[—–\-|*•\s]+(?=\S)/, "")
+        .replace(/\s*[|{}\[\]]+(?=\s*(?:✅)?$)/, "")
+        .trim();
+      const letters = (l.text.match(/[A-Za-z\u0600-\u06FF]/g) || []).length;
+      if (letters < 3) return false;
+      if (l.conf < 50 && !l.tick) return false;
+      // OCR noise from photos: many tiny "words" ("تا مت ا تت حا ا ا")
+      const words = l.text.replace(/\s*✅$/, "").split(" ").filter(Boolean);
+      if (words.length >= 4 && words.join("").length / words.length < 2.5) return false;
+      return !isScreenshotHeader(l.text);
+    });
+    // A big vertical gap between two lines = a new screenshot box = a new question
+    const out = [];
+    kept.forEach((l, i) => {
+      const prev = kept[i - 1];
+      if (prev && prev.bbox && l.bbox) {
+        const h = Math.max(prev.bbox.y1 - prev.bbox.y0, l.bbox.y1 - l.bbox.y0, 1);
+        if (l.bbox.y0 - prev.bbox.y1 > h * 1.2) out.push("---");
+      }
+      out.push(l.text);
+    });
+    return out;
   }
 
   // ---------- Screenshots (OCR) ----------
@@ -612,12 +810,7 @@ function parseRawQuestions(text) {
     const worker = await getOcrWorker();
     ocrLabel = label;
     const canvas = await imageFileToCanvas(file);
-    const res = await worker.recognize(canvas);
-    const lines = String((res && res.data && res.data.text) || "")
-      .replace(/\r/g, "")
-      .split("\n")
-      .map((l) => l.replace(/\s+/g, " ").trim())
-      .filter((l) => l && !isScreenshotHeader(l));
+    const lines = await ocrCanvasLines(worker, canvas);
     return lines.join("\n");
   }
 
@@ -777,8 +970,8 @@ function parseRawQuestions(text) {
           (coverTotal ? " Found " + coverTotal + " cover page(s) inside the file(s); they will be inserted in position (lines like [[COVER:...]] - keep them)." : "") +
           (shotCount ? " Screenshots are read automatically (OCR), so check the text for small mistakes." : "") +
           (pictureTotal
-            ? " " + pictureTotal + " PDF page(s) were pictures: each one is kept as the original picture page (with its photos and ✅ answers)." +
-              (scannedTotal ? " Their text was read with OCR into the box below: to get editable question blocks too, number the questions (1. 2. ...), fix OCR mistakes and add the answers - ✅ ticks and photos can't be read as text." : "")
+            ? " " + pictureTotal + " PDF page(s) were pictures: each one is kept as the original picture page (with its photos)." +
+              (scannedTotal ? " Their text was read with OCR into the box below and becomes editable question blocks: green ✅ ticks are taken as the answers, and \"---\" marks a new screenshot box. OCR makes small mistakes, so check the questions." : "")
             : "") +
           " Check the text below, fix anything, then press \"Parse & Generate Blocks\"." +
           (problems.length ? " Problems: " + problems.join(" | ") : ""),

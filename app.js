@@ -762,7 +762,7 @@ function createScanBlockElement(q, index, assignedPage = 2) {
   note.style.cssText = "font-size:12px; color:#334155; line-height:1.5;";
   note.innerHTML = `<b>${escapeHtml(q.label || "Original picture")}</b><br>
     This page had no text (it is made of pictures), so it is printed exactly as it was.
-    Its text was also read with OCR into the import box: questions that have numbers (1. 2. ...) become editable blocks after it - keep the picture, the blocks, or both.`;
+    Its questions were also read with OCR (✅ ticks become the answers) and follow as editable blocks - keep the picture, the blocks, or both.`;
   body.appendChild(thumb);
   body.appendChild(note);
 
@@ -1174,7 +1174,8 @@ function resequenceQuestionNumbers() {
   let n = 0;
   examData.questions.forEach((q) => {
     if (q.type === "cover") {
-      n = 0;
+      // a real cover starts a new lecture; a picture page (kind "scan") keeps counting
+      if (q.kind !== "scan") n = 0;
       q.number = "";
       return;
     }
