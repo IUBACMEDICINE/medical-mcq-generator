@@ -1959,7 +1959,7 @@ function downloadAsPdf() {
     margin: 0,
     filename: `${examData.settings.subject || 'Lecture'}_${examData.settings.lectureNum || 'Exam'}.pdf`,
     image: { type: 'jpeg', quality: 0.98 },
-    html2canvas: { scale: 2, useCORS: true, scrollX: 0, scrollY: 0, windowWidth: 816 },
+    html2canvas: { scale: 2, useCORS: true, scrollX: 0, scrollY: 0 },
     jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' },
     pagebreak: { mode: ['css'] }
   };
